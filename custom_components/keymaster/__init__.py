@@ -1,527 +1,684 @@
-"""keymaster Integration."""
+"""The Key Master integration."""
 import asyncio
-from datetime import timedelta
 import logging
-from typing import Any, Dict
-
-from openzwavemqtt.const import ATTR_CODE_SLOT, CommandClass
-from openzwavemqtt.exceptions import NotFoundError, NotSupportedError
-from openzwavemqtt.util.node import get_node_from_manager
 import voluptuous as vol
+import homeassistant.helpers.config_validation as cv
+
+from datetime import timedelta
+from typing import Optional
+
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.core import HomeAssistant, Event, CoreState, callback
+from homeassistant.helpers.event import async_call_later
+from homeassistant.util import Throttle
+from openzwavemqtt.const import CommandClass
 
 from homeassistant.components.ozw import DOMAIN as OZW_DOMAIN
-from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import ATTR_ENTITY_ID, EVENT_HOMEASSISTANT_STARTED
-from homeassistant.core import Config, Event, HomeAssistant, ServiceCall, State
-from homeassistant.helpers.event import async_track_state_change
-from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
+from homeassistant.components.zwave import DOMAIN as ZWAVE_DOMAIN
 
+from homeassistant.const import EVENT_STATE_CHANGED
+from .sensor import CodeSensor, ATTR_SENSOR_SLOT_ENABLED, ATTR_SENSOR_SETTINGS
+from .schema import SLOT_SETTINGS_SCHEMA
 from .const import (
-    ATTR_NAME,
-    ATTR_NODE_ID,
-    ATTR_USER_CODE,
-    CHILD_LOCKS,
+    DOMAIN,
+    LOCK_DOMAIN,
+    NOTIFY_DOMAIN,
+    SENSOR_DOMAIN,
+    ATTR_ENTITY_ID,
     CONF_ALARM_LEVEL,
-    CONF_ALARM_LEVEL_OR_USER_CODE_ENTITY_ID,
     CONF_ALARM_TYPE,
-    CONF_ALARM_TYPE_OR_ACCESS_CONTROL_ENTITY_ID,
-    CONF_CHILD_LOCKS,
-    CONF_CHILD_LOCKS_FILE,
     CONF_ENTITY_ID,
-    CONF_GENERATE,
-    CONF_HIDE_PINS,
-    CONF_LOCK_ENTITY_ID,
     CONF_LOCK_NAME,
-    CONF_PATH,
+    CONF_LOCK_NAME_SAFE,
+    CONF_NOTIFY,
+    CONF_NOTIFY_DOOR_LEFT_OPEN,
+    CONF_NOTIFY_DOOR_OPEN,
+    CONF_OPEN_DURATION,
     CONF_SENSOR_NAME,
     CONF_SLOTS,
-    CONF_START,
-    COORDINATOR,
-    DEFAULT_HIDE_PINS,
-    DOMAIN,
-    ISSUE_URL,
-    MANAGER,
-    PLATFORMS,
-    PRIMARY_LOCK,
-    UNSUB_LISTENERS,
-    VERSION,
-    ZWAVE_NETWORK,
+    CONF_START, CODES_KWIKSET, CONF_NOTIFY_LOCK_GENERAL,
 )
-from .exceptions import NoNodeSpecifiedError, ZWaveIntegrationNotConfiguredError
-from .helpers import (
-    delete_folder,
-    delete_lock_and_base_folder,
-    get_node_id,
-    handle_state_change,
-    remove_generated_entities,
-    using_ozw,
-    using_zwave,
-)
-from .lock import KeymasterLock
-from .services import add_code, clear_code, generate_package_files, refresh_codes
 
-_LOGGER = logging.getLogger(__name__)
+PLATFORMS = ["sensor"]
 
-SERVICE_GENERATE_PACKAGE = "generate_package"
+# Services
 SERVICE_ADD_CODE = "add_code"
 SERVICE_CLEAR_CODE = "clear_code"
 SERVICE_REFRESH_CODES = "refresh_codes"
+SERVICE_UPDATE_SLOT = "update_slot"
+SERVICE_CLEAR_SLOT = "clear_slot"
+SERVICE_SLOT_ENABLED = "slot_enabled"
+SERVICE_UPDATE_SETTINGS = "update_settings"
+SERVICE_RESET_LOCK = "reset_lock"
 
-SET_USERCODE = "set_usercode"
-CLEAR_USERCODE = "clear_usercode"
+# Zwave
+ZWAVE_MANAGER = "manager"
+ZWAVE_SET_USERCODE = "set_usercode"
+ZWAVE_CLEAR_USERCODE = "clear_usercode"
+ZWAVE_INSTANCE_ID = 1
+OZW_STATUS_LEVELS = ["driverAwakeNodesQueried", "driverAllNodesQueriedSomeDead", "driverAllNodesQueried"]
+ZWAVE_NETWORK = "zwave_network"
+
+ENTRY = "entry"
+ENTRY_TYPE = "type"
+ENTRY_ID = "entry_id"
+INDEX = "index"
+STATUS = "Status"
+VALUE = "value"
+SENSORS = "sensors"
+UPDATE_LISTENER = "update_listener"
+ATTR_NODE_ID = "node_id"
+ATTR_USER_CODE = "usercode"
+ATTR_CODE_SLOT = "code_slot"
+LOCK_INFO = "lock_info"
+
+# Lock
+LOCK_MANUFACTURER = "manufacturer"
+LOCK_MODEL = "model"
+
+# Code
+CODE_STATUS = "status"
+CODE_USER = "user"
+CODE_NOTIFY = "notify"
+
+DEVICES_WITH_EVENTS = [CONF_ENTITY_ID, CONF_SENSOR_NAME, CONF_ALARM_TYPE]
+
+REFRESH_CODE_SCHEMA = vol.Schema({
+    vol.Required(ATTR_ENTITY_ID): cv.entity_domain(LOCK_DOMAIN)
+})
+
+RESET_LOCK_SCHEMA = vol.Schema({
+    vol.Required(ATTR_ENTITY_ID): cv.entity_domain(LOCK_DOMAIN)
+})
+
+CLEAR_CODE_SCHEMA = vol.Schema({
+    vol.Required(ATTR_ENTITY_ID): vol.All(cv.entity_domain(SENSOR_DOMAIN), vol.Match(r'^sensor\..*_code_slot_\d*$'))
+})
+
+UPDATE_CODE_SCHEMA = vol.Schema({
+    vol.Required(ATTR_ENTITY_ID): vol.All(cv.entity_domain(SENSOR_DOMAIN), vol.Match(r'^sensor\..*_code_slot_\d*$')),
+    vol.Required(ATTR_USER_CODE): int,
+})
+
+SLOT_ENABLED_SCHEMA = vol.Schema({
+    vol.Required(ATTR_ENTITY_ID): vol.All(cv.entity_domain(SENSOR_DOMAIN), vol.Match(r'^sensor\..*_code_slot_\d*$')),
+    vol.Required(ATTR_SENSOR_SLOT_ENABLED): bool,
+})
 
 
-async def async_setup(hass: HomeAssistant, config: Config) -> bool:
-    """Disallow configuration via YAML."""
-    return True
+_LOGGER = logging.getLogger(__name__)
 
 
-async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> bool:
-    """Set up is called when Home Assistant is loading our component."""
-    hass.data.setdefault(DOMAIN, {})
-    _LOGGER.info(
-        "Version %s is starting, if you have any issues please report" " them here: %s",
-        VERSION,
-        ISSUE_URL,
-    )
-    should_generate_package = config_entry.data.get(CONF_GENERATE)
+class LockManagerCoordinator:
+    """Define an object to hold Key Master Data"""
 
-    updated_config = config_entry.data.copy()
+    def __init__(self, hass: HomeAssistant):
+        """Initialize"""
+        self._hass = hass
+        self.updater = Updater(hass, self)
+        self._event_listener = None
+        self._services = []
+        self._entries = {}
+        self._event_watch_list = {}
+        self._load()
+        self._default_notifier = None
+        self._door_timer = None
+        self._lock_timer = None
 
-    # pop CONF_GENERATE if it is in data
-    updated_config.pop(CONF_GENERATE, None)
+    @property
+    def automation_enabled(self) -> bool:
+        """Has everything started and automation is enabled"""
+        # hass.bus.async_listen_once(EVENT_HOMEASSISTANT_START, almond_hass_start)
+        if self._hass.state != CoreState.running:
+            # _LOGGER.warning("Automation not ready : HA has not started")
+            return False
 
-    # If CONF_PATH is absolute, make it relative. This can be removed in the future,
-    # it is only needed for entries that are being migrated from using the old absolute
-    # path
-    config_path = hass.config.path()
-    if config_entry.data[CONF_PATH].startswith(config_path):
-        updated_config[CONF_PATH] = updated_config[CONF_PATH][len(config_path) :]
-        # Remove leading slashes
-        updated_config[CONF_PATH] = updated_config[CONF_PATH].lstrip("/").lstrip("\\")
+        if OZW_DOMAIN in self._hass.data:
+            manager = self._hass.data[OZW_DOMAIN][ZWAVE_MANAGER]
+            status = manager.get_instance(ZWAVE_INSTANCE_ID).get_status().data[STATUS]
+            if status not in OZW_STATUS_LEVELS:
+                _LOGGER.warning(f"Automation not ready : OZW not loaded - status:{status}")
+                return False
 
-    if updated_config != config_entry.data:
-        hass.config_entries.async_update_entry(config_entry, data=updated_config)
+        if ZWAVE_NETWORK in self._hass.data:
+            # TODO Test zwave network
+            # self._hass.data[ZWAVE_NETWORK]
+            _LOGGER.warning(f"Automation not ready : ZWAVE not loaded")
+            return False
 
-    config_entry.add_update_listener(update_listener)
+        return True
 
-    primary_lock = KeymasterLock(
-        config_entry.data[CONF_LOCK_NAME],
-        config_entry.data[CONF_LOCK_ENTITY_ID],
-        config_entry.data[CONF_ALARM_LEVEL_OR_USER_CODE_ENTITY_ID],
-        config_entry.data[CONF_ALARM_TYPE_OR_ACCESS_CONTROL_ENTITY_ID],
-        config_entry.data[CONF_SENSOR_NAME],
-    )
-    child_locks = [
-        KeymasterLock(
-            lock_name,
-            lock[CONF_LOCK_ENTITY_ID],
-            lock[CONF_ALARM_LEVEL_OR_USER_CODE_ENTITY_ID],
-            lock[CONF_ALARM_TYPE_OR_ACCESS_CONTROL_ENTITY_ID],
-        )
-        for lock_name, lock in config_entry.data.get(CONF_CHILD_LOCKS, {}).items()
-    ]
-    hass.data[DOMAIN][config_entry.entry_id] = {
-        PRIMARY_LOCK: primary_lock,
-        CHILD_LOCKS: child_locks,
-        UNSUB_LISTENERS: [],
-    }
-    coordinator = LockUsercodeUpdateCoordinator(hass, config_entry)
-    hass.data[DOMAIN][config_entry.entry_id][COORDINATOR] = coordinator
+    @property
+    def entries(self):
+        """Return the current entries"""
+        return self._entries
 
-    # Button Press
-    async def _refresh_codes(service: ServiceCall) -> None:
-        """Refresh lock codes."""
-        _LOGGER.debug("Refresh Codes service: %s", service)
-        entity_id = service.data[ATTR_ENTITY_ID]
-        instance_id = 1
-        await refresh_codes(hass, entity_id, instance_id)
+    def add_sensor(self, code_sensor: CodeSensor, entry: ConfigEntry) -> None:
+        self._entries[entry.entry_id][SENSORS][f"sensor.{code_sensor.name}"] = code_sensor
 
-    hass.services.async_register(
-        DOMAIN,
-        SERVICE_REFRESH_CODES,
-        _refresh_codes,
-        schema=vol.Schema(
-            {
-                vol.Required(ATTR_ENTITY_ID): vol.Coerce(str),
+    async def _get_device(self, entity_id):
+        _entity_registry = await self._hass.helpers.entity_registry.async_get_registry()
+        _entity = _entity_registry.async_get(entity_id)
+        _device_id = _entity.device_id
+        _device_registry = await self._hass.helpers.device_registry.async_get_registry()
+        _device = _device_registry.async_get(_device_id)
+        return _device
+
+    def _find_sensor(self, sensor_name: str) -> Optional[CodeSensor]:
+        for k, v in self._entries.items():
+            if sensor_name in v[SENSORS].keys():
+                return v[SENSORS][sensor_name]
+        return None
+
+    async def _find_lock(self, lock_name: str) -> Optional[ConfigEntry]:
+        for k, v in self._entries.items():
+            if lock_name == v[ENTRY].data[CONF_ENTITY_ID]:
+                return v[ENTRY]
+        return None
+
+    async def load_entry(self, entry: ConfigEntry) -> None:
+        """Add a new entry"""
+        entry.options = entry.data  # Sync data/options
+        _device = await self._get_device(entry.data[ATTR_ENTITY_ID])
+        self._entries[entry.entry_id] = {
+            ENTRY: entry,
+            UPDATE_LISTENER: entry.add_update_listener(update_listener),
+            SENSORS: {},
+            LOCK_INFO: {
+                LOCK_MANUFACTURER: _device.manufacturer,
+                LOCK_MODEL: _device.model,
             }
-        ),
-    )
+        }
 
-    # Add code
-    async def _add_code(service: ServiceCall) -> None:
-        """Set a user code."""
-        _LOGGER.debug("Add Code service: %s", service)
-        entity_id = service.data[ATTR_ENTITY_ID]
-        code_slot = service.data[ATTR_CODE_SLOT]
-        usercode = service.data[ATTR_USER_CODE]
-        await add_code(hass, entity_id, code_slot, usercode)
+        # Picking one of the entries notifiers as a fallback notifier
+        if not self._default_notifier and CONF_NOTIFY in entry.data and entry.data[CONF_NOTIFY]:
+            self._default_notifier = entry.data[CONF_NOTIFY]
 
-    hass.services.async_register(
-        DOMAIN,
-        SERVICE_ADD_CODE,
-        _add_code,
-        schema=vol.Schema(
-            {
-                vol.Required(ATTR_ENTITY_ID): vol.Coerce(str),
-                vol.Required(ATTR_CODE_SLOT): vol.Coerce(int),
-                vol.Required(ATTR_USER_CODE): vol.Coerce(str),
-            }
-        ),
-    )
+        # Adding events we want to watch to the watch list
+        for d in DEVICES_WITH_EVENTS:
+            if entry.data[d]:
+                self._event_watch_list[entry.data[d]] = {
+                    ATTR_ENTITY_ID: entry.data[d],
+                    ENTRY_TYPE: d,
+                    ENTRY_ID: entry.entry_id
+                }
 
-    # Clear code
-    async def _clear_code(service: ServiceCall) -> None:
-        """Clear a user code."""
-        _LOGGER.debug("Clear Code service: %s", service)
-        entity_id = service.data[ATTR_ENTITY_ID]
-        code_slot = service.data[ATTR_CODE_SLOT]
-        await clear_code(hass, entity_id, code_slot)
+        for component in PLATFORMS:
+            self._hass.async_create_task(
+                self._hass.config_entries.async_forward_entry_setup(entry, component)
+            )
 
-    hass.services.async_register(
-        DOMAIN,
-        SERVICE_CLEAR_CODE,
-        _clear_code,
-        schema=vol.Schema(
-            {
-                vol.Required(ATTR_ENTITY_ID): vol.Coerce(str),
-                vol.Required(ATTR_CODE_SLOT): vol.Coerce(int),
-            }
-        ),
-    )
-
-    # Generate package files
-    def _generate_package(service: ServiceCall) -> None:
-        """Generate the package files."""
-        _LOGGER.debug("DEBUG: %s", service)
-        name = service.data[ATTR_NAME]
-        generate_package_files(hass, name)
-
-    hass.services.async_register(
-        DOMAIN,
-        SERVICE_GENERATE_PACKAGE,
-        _generate_package,
-        schema=vol.Schema({vol.Optional(ATTR_NAME): vol.Coerce(str)}),
-    )
-
-    for platform in PLATFORMS:
-        hass.async_create_task(
-            hass.config_entries.async_forward_entry_setup(config_entry, platform)
-        )
-
-    # if the use turned on the bool generate the files
-    if should_generate_package:
-        servicedata = {"lockname": primary_lock.lock_name}
-        await hass.services.async_call(DOMAIN, SERVICE_GENERATE_PACKAGE, servicedata)
-
-    async def async_entity_state_listener(
-        changed_entity: str, old_state: State, new_state: State
-    ) -> None:
-        """Listener to handle state changes to lock entities."""
-        handle_state_change(hass, config_entry, changed_entity, old_state, new_state)
-
-    async def async_homeassistant_started_listener(evt: Event):
-        """Start tracking state changes after HomeAssistant has started."""
-        # Listen to lock state changes so we can fire an event
-        hass.data[DOMAIN][config_entry.entry_id][UNSUB_LISTENERS].append(
-            async_track_state_change(
-                hass, primary_lock.lock_entity_id, async_entity_state_listener
+    async def unload_entry(self, entry: ConfigEntry, reload: bool = False) -> bool:
+        """Remove an entry"""
+        unload_ok = all(
+            await asyncio.gather(
+                *[
+                    self._hass.config_entries.async_forward_entry_unload(entry, component)
+                    for component in PLATFORMS
+                ]
             )
         )
 
-    hass.bus.async_listen_once(
-        EVENT_HOMEASSISTANT_STARTED, async_homeassistant_started_listener
-    )
+        self._entries[entry.entry_id][UPDATE_LISTENER]()
+        self._entries.pop(entry.entry_id)
 
+        # Remove sensors from watch list
+        for d in DEVICES_WITH_EVENTS:
+            if entry.data[d]:
+                self._event_watch_list.pop(entry.data[d])
+
+        if not reload:
+            # If we have no more entries remove services and listeners
+            if len(self._entries) == 0:
+                await self._unload_services()
+                await self._unload_event_listener()
+
+        return unload_ok
+
+    async def update_entry(self, entry: ConfigEntry) -> None:
+        """Update an entry"""
+        await self.unload_entry(entry, True)
+        await self.load_entry(entry)
+
+    async def remove_entry(self, entry: ConfigEntry) -> None:
+        """Remove an entry"""
+
+    async def state_changed(self, _: Event, args):
+        # Lock state changed
+        if args[ENTRY_TYPE] == CONF_ENTITY_ID:
+            _LOGGER.debug("Lock State Changed", args)
+            await self._lock_state_changed(_, args)
+        # Door state changed
+        elif args[ENTRY_TYPE] == CONF_SENSOR_NAME:
+            _LOGGER.debug("Door State Changed", args)
+            await self._door_state_changed(_, args)
+        elif args[ENTRY_TYPE] == CONF_ALARM_TYPE:
+            _LOGGER.debug("Alarm State Changed", args)
+            await self._door_state_changed(_, args)
+
+    async def _lock_state_changed(self, _: Event, args):
+        """The lock state changed"""
+        _entry: ConfigEntry = self._entries[args[ENTRY_ID]][ENTRY]
+        _notifier = _entry.data[CONF_NOTIFY]
+        _should_alert = _entry.data[CONF_NOTIFY_DOOR_OPEN]
+
+        _LOGGER.debug(f"Lock has been {_.data['new_state'].state}")
+
+        @callback
+        async def _lock_changed(_now) -> None:
+            _alert = f"{_entry.data[CONF_LOCK_NAME]} : Lock state changed and change event did not fire." \
+                     f"Could be boot."
+            _LOGGER.error(_alert)
+
+            if _notifier and _should_alert:
+                await self.notify(_alert, _notifier)
+            return
+
+        self._lock_timer = async_call_later(self._hass, 30, _lock_changed)
+
+    async def _alarm_level_changed(self,  _: Event, args):
+        _entry: ConfigEntry = self._entries[args[ENTRY_ID]][ENTRY]
+        _notifier = _entry.data[CONF_NOTIFY]
+        _name = _entry.data[CONF_LOCK_NAME]
+        _safe_name = _entry.data[CONF_LOCK_NAME_SAFE]
+        _lock_info = self._entries[args[ENTRY_ID]][LOCK_INFO]
+        _lock_const = {}
+
+        if "kwikset" in _lock_info[LOCK_MANUFACTURER].lower():
+            _lock_const = CODES_KWIKSET
+        elif "schlage" in _lock_info[LOCK_MANUFACTURER].lower():
+            _lock_const = CODES_KWIKSET
+
+        if _lock_const:
+            _type = self._hass.states.get(_entry.data[CONF_ALARM_TYPE])
+            _level = self._hass.states.get(_entry.data[CONF_ALARM_LEVEL])
+
+            _status = _lock_const[CODE_STATUS][_type]
+
+            if _status in _lock_const[CODE_STATUS]:
+                # Alarm was triggered by a user
+                _user = _level
+                _code_sensor = self._find_sensor(f"sensor.{_safe_name}_code_slot_{_user}")
+                if _code_sensor:
+                    await _code_sensor.increment_counter()
+                    if _code_sensor.should_alert and _notifier:
+                        await self.notify(f"{_status} : {_code_sensor.user_name}.", _notifier)
+
+                else:
+                    _LOGGER.error("Lock state changed via unknown user")
+
+            else:
+                _should_alert = _entry.data[CONF_NOTIFY_LOCK_GENERAL]
+                if _should_alert and _type in _lock_const[CODE_NOTIFY] and _notifier:
+                    await self.notify(f"{_name} status changed to {_status}.", _notifier)
+
+            if self._lock_timer:
+                self._lock_timer()
+                self._lock_timer = None
+        else:
+            _LOGGER.error("Could not match lock manufacturer")
+
+    async def _door_state_changed(self, _: Event, args):
+        """The lock door changed"""
+        _entry: ConfigEntry = self._entries[args[ENTRY_ID]][ENTRY]
+        _should_alert = _entry.data[CONF_NOTIFY_DOOR_OPEN]
+        _notifier = _entry.data[CONF_NOTIFY]
+        _name = _entry.data[CONF_LOCK_NAME]
+
+        @callback
+        async def _door_remains_open(_now) -> None:
+            await self.notify(f"{_name} has been left open.", _notifier)
+            self._door_timer = async_call_later(self._hass, _entry.data[CONF_OPEN_DURATION], _door_remains_open)
+            return
+
+        if _.data['new_state'].state == 'on' and _should_alert and _notifier:
+            await self.notify(f"{_name} has been opened.", _notifier)
+
+        if _entry.data[CONF_NOTIFY_DOOR_LEFT_OPEN] and _.data['new_state'].state == 'on':
+            self._door_timer = async_call_later(self._hass, _entry.data[CONF_OPEN_DURATION], _door_remains_open)
+        else:
+            if self._door_timer:
+                self._door_timer()
+                self._door_timer = None
+
+    def generate_lovelace(self):
+        return
+
+    async def reset_lock(self, entity: str):
+        _LOGGER.debug("Resetting Lock")
+        entry = await self._find_lock(entity)
+        if entry:
+            sensors = self._entries[entry.entry_id][SENSORS]
+            for s in sensors.values():
+                await s.reset_slot()
+        return
+
+    async def zwave_refresh_codes(self, entity: str):
+        if not self.automation_enabled:
+            # Bail if network is not ready
+            return
+
+        _LOGGER.debug("Zwave Refresh Codes call started.")
+        if OZW_DOMAIN in self._hass.data:
+            try:
+                state = self._hass.states.get(entity)
+                node_id = state.attributes[ATTR_NODE_ID]
+                manager = self._hass.data[OZW_DOMAIN][ZWAVE_MANAGER]
+                lock_values = manager.get_instance(ZWAVE_INSTANCE_ID).get_node(node_id).values()
+                for value in lock_values:
+                    if (
+                            value.command_class == CommandClass.USER_CODE
+                            and value.index == 255
+                    ):
+                        _LOGGER.debug(
+                            "DEBUG: Index found valueIDKey: %s", int(value.value_id_key)
+                        )
+                        value.send_value(True)
+                        value.send_value(False)
+            except Exception:
+                _LOGGER.error("Error extracting node_id")
+
+        _LOGGER.debug("Zwave Refresh Codes call completed.")
+
+    async def zwave_update_code(self, service_data: dict, clear: bool = False):
+        if not self.automation_enabled:
+            # Bail if network is not ready
+            return
+
+        _LOGGER.debug(f"Zwave Code update call started.")
+
+        if OZW_DOMAIN in self._hass.data:
+            domain = OZW_DOMAIN
+        elif ZWAVE_NETWORK in self._hass.data:
+            domain = ZWAVE_DOMAIN
+        else:
+            _LOGGER.info("Cannot find the zwave domain")
+            return
+
+        if clear:
+            action = ZWAVE_CLEAR_USERCODE
+            service_data.pop(ATTR_USER_CODE)
+        else:
+            action = ZWAVE_SET_USERCODE
+
+        try:
+            await self._hass.services.async_call(domain, action, service_data)
+        except Exception as err:
+            _LOGGER.error(
+                f"Error calling {domain}.{action} service call: {str(err)}"
+            )
+            pass
+
+        _LOGGER.debug(f"Zwave Code {domain}.{action} call completed.")
+
+    async def entity_update_code(self, entity: CodeSensor, clear: bool = False):
+        _LOGGER.debug(f"Entity Code update call started.")
+        service_data = {
+            ATTR_ENTITY_ID: entity.parent,
+            ATTR_CODE_SLOT: entity.slot,
+            ATTR_USER_CODE: entity.code
+        }
+        await self.zwave_update_code(service_data, clear)
+        _LOGGER.debug(f"Entity Code update call finished.")
+
+    async def notify(self, message: str, service: str = None, important: bool = False):
+        """Used for notifications"""
+        if self.automation_enabled:
+            _LOGGER.info(message)
+
+            if not service:
+                service = self._default_notifier
+
+            if service:
+                await self._hass.services.async_call(NOTIFY_DOMAIN, service, {"message": message})
+
+            if important:
+                await self._hass.services.async_call(NOTIFY_DOMAIN, "persistent_notification", {"message": message})
+
+    def _load(self):
+
+        # region Event Listener
+        async def event_listener(_: Event) -> None:
+            if self.automation_enabled:
+                if _.data[ATTR_ENTITY_ID] in self._event_watch_list.keys():
+                    _entry = self._event_watch_list[_.data[ATTR_ENTITY_ID]]
+                    await self.state_changed(_, _entry)
+
+        self._event_listener = self._hass.bus.async_listen(EVENT_STATE_CHANGED, event_listener)
+        # endregion
+
+        # region Reset Lock
+        async def _reset_lock(service):
+            """Reset Lock - Service"""
+            _LOGGER.debug("Resetting Lock")
+            lock = service.data[ATTR_ENTITY_ID]
+            await self.reset_lock(lock)
+
+        self._services.append(SERVICE_RESET_LOCK)
+        self._hass.services.async_register(DOMAIN, SERVICE_RESET_LOCK, _reset_lock, RESET_LOCK_SCHEMA)
+        # endregion
+
+        # region Refresh Lock Codes
+        async def _refresh_lock_codes(service):
+            """Refresh Lock Codes - Service"""
+            _LOGGER.debug("Refreshing Lock Codes")
+            lock = service.data[ATTR_ENTITY_ID]
+            await self.zwave_refresh_codes(lock)
+
+        self._services.append(SERVICE_REFRESH_CODES)
+        self._hass.services.async_register(DOMAIN, SERVICE_REFRESH_CODES, _refresh_lock_codes, REFRESH_CODE_SCHEMA)
+        # endregion
+
+        # region Update Slot
+        async def _update_slot(service):
+            """Update Code Sensor - Service"""
+            _LOGGER.debug("Updating the CodeSensor")
+            _sensor_name = service.data[ATTR_ENTITY_ID]
+            _code = service.data[ATTR_USER_CODE]
+            _entity: CodeSensor = self._find_sensor(_sensor_name)
+
+            if _entity:
+                await _entity.update_code(_code)
+
+        self._services.append(SERVICE_UPDATE_SLOT)
+        self._hass.services.async_register(DOMAIN, SERVICE_UPDATE_SLOT, _update_slot, UPDATE_CODE_SCHEMA)
+
+        # endregion
+
+        # region Clear Slot
+        async def _clear_slot(service):
+            """Reset Code Sensor - Service"""
+            _LOGGER.debug("Clearing the CodeSensor")
+            _sensor_name = service.data[ATTR_ENTITY_ID]
+            _entity: CodeSensor = self._find_sensor(_sensor_name)
+
+            if _entity:
+                await _entity.reset_slot()
+
+        self._services.append(SERVICE_CLEAR_SLOT)
+        self._hass.services.async_register(DOMAIN, SERVICE_CLEAR_SLOT, _clear_slot, CLEAR_CODE_SCHEMA)
+        # endregion
+
+        # region Enable/Disable Slot
+        async def _slot_enabled(service):
+            """Enable or Disable the slot"""
+            _LOGGER.debug("Enable/Disable code slot")
+            _sensor_name = service.data[ATTR_ENTITY_ID]
+            _state = service.data[ATTR_SENSOR_SLOT_ENABLED]
+
+            _entity: CodeSensor = self._find_sensor(_sensor_name)
+            if _entity:
+                if _state:
+                    await _entity.enable()
+                else:
+                    await _entity.disable()
+
+        self._services.append(SERVICE_SLOT_ENABLED)
+        self._hass.services.async_register(DOMAIN, SERVICE_SLOT_ENABLED, _slot_enabled, SLOT_ENABLED_SCHEMA)
+        # endregion
+
+        # region Update slot settings
+        async def _slot_settings(service):
+            """Update the settings of the slot"""
+            _LOGGER.debug("Updating code slot settings")
+            _sensor_name = service.data[ATTR_ENTITY_ID]
+            _settings = service.data[ATTR_SENSOR_SETTINGS]
+
+            _entity: CodeSensor = self._find_sensor(_sensor_name)
+
+            if _entity:
+                await _entity.update_settings(_settings)
+
+        self._services.append(SERVICE_UPDATE_SETTINGS)
+        self._hass.services.async_register(DOMAIN, SERVICE_UPDATE_SETTINGS, _slot_settings, SLOT_SETTINGS_SCHEMA)
+        # endregion
+
+    async def _unload_services(self):
+        for s in self._services:
+            self._hass.services.remove(s)
+
+    async def _unload_event_listener(self):
+        self._event_listener.remove()
+
+
+class Updater:
+    """The class for handling the data retrieval."""
+
+    def __init__(self, hass, coordinator: LockManagerCoordinator):
+        """Initialize the data object."""
+        self._hass = hass
+        self._errors = 0
+        self._enabled = False
+        self.update = Throttle(timedelta(seconds=30))(self.update)
+        self._coordinator = coordinator
+
+    @property
+    def enabled(self):
+        return self._enabled
+
+    def enable(self):
+        """Enable Data Updater"""
+        self._enabled = True
+
+    def disable(self):
+        """Disable Data Updater"""
+        self._enabled = False
+
+    async def _get_latest_zwave_data(self):
+        """Connect and retrieve zwave information"""
+
+        if not self._coordinator.automation_enabled or not self.enabled:
+            # Bail if network is not ready
+            return
+
+        _LOGGER.debug("Starting to fetch codes from zwave")
+        entries = self._coordinator.entries
+
+        for entry in entries:
+            domain = None
+            _entry: ConfigEntry = entries[entry][ENTRY]
+            _sensors = entries[entry][SENSORS]
+            try:
+                state = self._hass.states.get(_entry.data[ATTR_ENTITY_ID])
+                node_id = state.attributes[ATTR_NODE_ID]
+                lock_values = None
+                lower_index = _entry.data[CONF_START]
+                upper_index = _entry.data[CONF_SLOTS] + lower_index - 1
+
+                if OZW_DOMAIN in self._hass.data:
+
+                    domain = OZW_DOMAIN
+                    manager = self._hass.data[OZW_DOMAIN][ZWAVE_MANAGER]
+                    lock_values = (
+                        manager
+                        .get_instance(ZWAVE_INSTANCE_ID)
+                        .get_node(node_id)
+                        .get_command_class(CommandClass.USER_CODE)
+                        .values()
+                    )
+                elif ZWAVE_NETWORK in self._hass.data:
+                    domain = ZWAVE_NETWORK
+                    network = self._hass.data[ZWAVE_NETWORK]
+                    lock_values = (
+                        network
+                        .nodes[node_id]
+                        .get_values(class_id=CommandClass.USER_CODE)
+                        .values()
+                    )
+                else:
+                    _LOGGER.info(f"No available zwave managers")
+
+                if lock_values:
+                    for value in lock_values:
+                        # Skip unwanted values from ozw
+                        if domain == OZW_DOMAIN and value.command_class != CommandClass.USER_CODE:
+                            continue
+
+                        # Skip unused indexes
+                        if not (lower_index <= value.index <= upper_index):
+                            continue
+
+                        # TODO check zwave platform
+                        # Normalize data structure
+                        data = {INDEX: value.index, VALUE: ""}
+                        if domain == OZW_DOMAIN:
+                            data[VALUE] = value.value
+                        else:
+                            data[VALUE] = value.data
+
+                        sensor_name = f"sensor.{_entry.data[CONF_LOCK_NAME_SAFE]}_code_slot_{data[INDEX]}"
+
+                        _LOGGER.debug(f"{sensor_name} value: {str(data[VALUE])}")
+
+                        if sensor_name in _sensors:
+                            entity: CodeSensor = _sensors[sensor_name]
+                            await entity.zwave_code_check(data[VALUE].replace("\x00", ""))
+
+            except Exception:
+                _LOGGER.error(f"Error getting codes from {domain} manager", exc_info=True)
+                self._errors += 1
+                if self._errors > 10:
+                    await self._coordinator.notify(
+                        "Data updater has been disabled due to too many errors.  Check Home Assistant logs.",
+                        important=True
+                    )
+
+        _LOGGER.debug("Finishing to fetch codes from zwave")
+
+    async def update(self):
+        await self._get_latest_zwave_data()
+
+
+async def async_setup(hass: HomeAssistant, config: dict):
+    """ Disallow configuration via YAML """
     return True
 
 
-async def async_unload_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> bool:
-    """Handle removal of an entry."""
+async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
+    """Set up Key Master from a config entry."""
+    if DOMAIN not in hass.data:
+        hass.data.setdefault(DOMAIN, LockManagerCoordinator(hass))
 
-    unload_ok = all(
-        await asyncio.gather(
-            *[
-                hass.config_entries.async_forward_entry_unload(config_entry, component)
-                for component in PLATFORMS
-            ]
-        )
-    )
+    coordinator: LockManagerCoordinator = hass.data[DOMAIN]
+    await coordinator.load_entry(entry)
+    return True
 
-    if unload_ok:
-        # Remove all generated helper entries
-        await remove_generated_entities(
-            hass,
-            config_entry,
-            range(config_entry.data[CONF_START], config_entry.data[CONF_SLOTS] + 1),
-            True,
-        )
 
-        # Remove all package files and the base folder if needed
-        await hass.async_add_executor_job(
-            delete_lock_and_base_folder, hass, config_entry
-        )
-
-        # Unsubscribe to any listeners
-        for unsub_listener in hass.data[DOMAIN][config_entry.entry_id].get(
-            UNSUB_LISTENERS, []
-        ):
-            unsub_listener()
-        hass.data[DOMAIN][config_entry.entry_id].get(UNSUB_LISTENERS, []).clear()
-
-        hass.data[DOMAIN].pop(config_entry.entry_id)
-
+async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry):
+    """Unload a config entry."""
+    coordinator: LockManagerCoordinator = hass.data[DOMAIN]
+    unload_ok = await coordinator.unload_entry(entry)
     return unload_ok
 
 
-async def async_migrate_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> bool:
-    """Migrate an old config entry."""
-    version = config_entry.version
-
-    # 1 -> 2: Migrate to new keys
-    if version == 1:
-        _LOGGER.debug("Migrating from version %s", version)
-        data = config_entry.data.copy()
-
-        data[CONF_ALARM_LEVEL_OR_USER_CODE_ENTITY_ID] = data.pop(CONF_ALARM_LEVEL)
-        data[CONF_ALARM_TYPE_OR_ACCESS_CONTROL_ENTITY_ID] = data.pop(CONF_ALARM_TYPE)
-        data[CONF_LOCK_ENTITY_ID] = data.pop(CONF_ENTITY_ID)
-        if CONF_HIDE_PINS not in data:
-            data[CONF_HIDE_PINS] = DEFAULT_HIDE_PINS
-        data[CONF_CHILD_LOCKS_FILE] = data.get(CONF_CHILD_LOCKS_FILE, "")
-
-        hass.config_entries.async_update_entry(entry=config_entry, data=data)
-        config_entry.version = 2
-        _LOGGER.debug("Migration to version %s complete", config_entry.version)
-
-    return True
+async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Remove an entry"""
+    coordinator: LockManagerCoordinator = hass.data[DOMAIN]
+    await coordinator.remove_entry(entry)
 
 
-async def update_listener(hass: HomeAssistant, config_entry: ConfigEntry) -> None:
+async def update_listener(hass: HomeAssistant, entry: ConfigEntry):
     """Update listener."""
-    # Get current code slots and new code slots, and remove entities for current code
-    # slots that are being removed
-    curr_slots = range(config_entry.data[CONF_START], config_entry.data[CONF_SLOTS] + 1)
-    new_slots = range(
-        config_entry.options[CONF_START], config_entry.options[CONF_SLOTS] + 1
-    )
-
-    await remove_generated_entities(
-        hass, config_entry, list(set(curr_slots) - set(new_slots)), False
-    )
-
-    # If the path has changed delete the old base folder, otherwise if the lock name
-    # has changed only delete the old lock folder
-    if config_entry.options[CONF_PATH] != config_entry.data[CONF_PATH]:
-        await hass.async_add_executor_job(
-            delete_folder, hass.config.path(), config_entry.data[CONF_PATH]
-        )
-    elif config_entry.options[CONF_LOCK_NAME] != config_entry.data[CONF_LOCK_NAME]:
-        await hass.async_add_executor_job(
-            delete_folder,
-            hass.config.path(),
-            config_entry.data[CONF_PATH],
-            config_entry.data[CONF_LOCK_NAME],
-        )
-
-    new_data = config_entry.options.copy()
-    new_data.pop(CONF_GENERATE, None)
-
-    hass.config_entries.async_update_entry(
-        entry=config_entry,
-        unique_id=config_entry.options[CONF_LOCK_NAME],
-        data=new_data,
-    )
-
-    primary_lock = KeymasterLock(
-        config_entry.data[CONF_LOCK_NAME],
-        config_entry.data[CONF_LOCK_ENTITY_ID],
-        config_entry.data[CONF_ALARM_LEVEL_OR_USER_CODE_ENTITY_ID],
-        config_entry.data[CONF_ALARM_TYPE_OR_ACCESS_CONTROL_ENTITY_ID],
-        config_entry.data[CONF_SENSOR_NAME],
-    )
-    hass.data[DOMAIN][config_entry.entry_id].update(
-        {
-            PRIMARY_LOCK: primary_lock,
-            CHILD_LOCKS: [
-                KeymasterLock(
-                    lock_name,
-                    lock[CONF_LOCK_ENTITY_ID],
-                    lock[CONF_ALARM_LEVEL_OR_USER_CODE_ENTITY_ID],
-                    lock[CONF_ALARM_TYPE_OR_ACCESS_CONTROL_ENTITY_ID],
-                )
-                for lock_name, lock in config_entry.data.get(
-                    CONF_CHILD_LOCKS, {}
-                ).items()
-            ],
-        }
-    )
-    servicedata = {"lockname": primary_lock.lock_name}
-    await hass.services.async_call(DOMAIN, SERVICE_GENERATE_PACKAGE, servicedata)
-
-    async def async_entity_state_listener(
-        changed_entity: str, old_state: State, new_state: State
-    ) -> None:
-        """Listener to track state changes to lock entities."""
-        handle_state_change(hass, config_entry, changed_entity, old_state, new_state)
-
-    # Unsubscribe to any listeners so we can create new ones
-    for unsub_listener in hass.data[DOMAIN][config_entry.entry_id].get(
-        UNSUB_LISTENERS, []
-    ):
-        unsub_listener()
-    hass.data[DOMAIN][config_entry.entry_id].get(UNSUB_LISTENERS, []).clear()
-
-    # Create new listeners
-    hass.data[DOMAIN][config_entry.entry_id][UNSUB_LISTENERS].append(
-        async_track_state_change(
-            hass, primary_lock.lock_entity_id, async_entity_state_listener
-        )
-    )
-
-
-class LockUsercodeUpdateCoordinator(DataUpdateCoordinator):
-    """Class to manage usercode updates."""
-
-    def __init__(self, hass: HomeAssistant, config_entry: ConfigEntry) -> None:
-        self._lock: KeymasterLock = hass.data[DOMAIN][config_entry.entry_id][
-            PRIMARY_LOCK
-        ]
-        super().__init__(
-            hass,
-            _LOGGER,
-            name=DOMAIN,
-            update_interval=timedelta(seconds=5),
-            update_method=self.async_update_usercodes,
-        )
-        self.data = {}
-
-    def _invalid_code(self, code_slot):
-        """Return the PIN slot value as we are unable to read the slot value
-        from the lock."""
-
-        _LOGGER.debug("Work around code in use.")
-        # This is a fail safe and should not be needing to return ""
-        data = ""
-
-        # Build data from entities
-        enabled_bool = f"input_boolean.{self._lock.lock_name}_enabled_{code_slot}"
-        enabled = self.hass.states.get(enabled_bool)
-        pin_data = f"input_text.{self._lock.lock_name}_pin_{code_slot}"
-        pin = self.hass.states.get(pin_data)
-
-        # If slot is enabled return the PIN
-        if enabled is not None and pin is not None:
-            if enabled.state == "on" and pin.state.isnumeric():
-                _LOGGER.debug("Utilizing BE469 work around code.")
-                data = pin.state
-            else:
-                _LOGGER.debug("Utilizing FE599 work around code.")
-                data = ""
-
-        return data
-
-    async def async_update_usercodes(self) -> Dict[str, Any]:
-        """Async wrapper to update usercodes."""
-        try:
-            return await self.hass.async_add_executor_job(self.update_usercodes)
-        except (
-            NotFoundError,
-            NotSupportedError,
-            NoNodeSpecifiedError,
-            ZWaveIntegrationNotConfiguredError,
-        ) as err:
-            raise UpdateFailed from err
-
-    def update_usercodes(self) -> Dict[str, Any]:
-        """Update usercodes."""
-        # loop to get user code data from entity_id node
-        instance_id = 1  # default
-        data = {}
-        data[CONF_LOCK_ENTITY_ID] = self._lock.lock_entity_id
-        node_id = get_node_id(self.hass, self._lock.lock_entity_id)
-        if node_id is None:
-            return data
-        data[ATTR_NODE_ID] = node_id
-
-        if data[ATTR_NODE_ID] is None:
-            raise NoNodeSpecifiedError
-
-        # # make button call
-        # servicedata = {"entity_id": self._entity_id}
-        # await self.hass.services.async_call(DOMAIN, SERVICE_REFRESH_CODES, servicedata)
-
-        # pull the codes for ozw
-        if using_ozw(self.hass):
-            # Raises exception when node not found
-            try:
-                node = get_node_from_manager(
-                    self.hass.data[OZW_DOMAIN][MANAGER],
-                    instance_id,
-                    data[ATTR_NODE_ID],
-                )
-            except NotFoundError:
-                return data
-
-            command_class = node.get_command_class(CommandClass.USER_CODE)
-
-            if not command_class:
-                raise NotSupportedError("Node doesn't have code slots")
-
-            for value in command_class.values():  # type: ignore
-                code_slot = int(value.index)
-                _LOGGER.debug(
-                    "DEBUG: Code slot %s value: %s", code_slot, str(value.value)
-                )
-                if value.value and "*" in str(value.value):
-                    _LOGGER.debug("DEBUG: Ignoring code slot with * in value.")
-                    data[code_slot] = self._invalid_code(code_slot)
-                else:
-                    data[code_slot] = value.value
-
-            return data
-
-        # pull codes for zwave
-        elif using_zwave(self.hass):
-            network = self.hass.data[ZWAVE_NETWORK]
-            node = network.nodes.get(data[ATTR_NODE_ID])
-            if not node:
-                raise NotFoundError
-
-            lock_values = node.get_values(class_id=CommandClass.USER_CODE).values()
-            for value in lock_values:
-                _LOGGER.debug(
-                    "DEBUG: Code slot %s value: %s",
-                    str(value.index),
-                    str(value.data),
-                )
-                # do not update if the code contains *s
-                code = str(value.data)
-
-                # Remove \x00 if found
-                code = code.replace("\x00", "")
-
-                # Check for * in lock data and use workaround code if exist
-                if "*" in code:
-                    _LOGGER.debug("DEBUG: Ignoring code slot with * in value.")
-                    code = self._invalid_code(value.index)
-
-                # Build data from entities
-                enabled_bool = (
-                    f"input_boolean.{self._lock.lock_name}_enabled_{value.index}"
-                )
-                enabled = self.hass.states.get(enabled_bool)
-
-                # Report blank slot if occupied by random code
-                if enabled is not None:
-                    if enabled.state == "off":
-                        _LOGGER.debug(
-                            "DEBUG: Utilizing Zwave clear_usercode work around code."
-                        )
-                        code = ""
-
-                data[int(value.index)] = code
-
-            return data
-        else:
-            raise ZWaveIntegrationNotConfiguredError
+    entry.data = entry.options
+    coordinator: LockManagerCoordinator = hass.data[DOMAIN]
+    await coordinator.update_entry(entry)

@@ -1,11 +1,14 @@
-{
+  {
   "domain": "keymaster",
   "name": "keymaster",
-  "documentation": "https://github.com/FutureTense/keymaster",
-  "dependencies": [],
-  "after_dependencies" : [ "input_boolean", "input_datetime", "input_number", "input_select", "ozw", "zwave" ],
-  "codeowners": ["@FutureTense", "@firstof9"],
   "config_flow": true,
+  "documentation": "https://github.com/FutureTense/keymaster",
   "issue_tracker": "https://github.com/FutureTense/keymaster/issues",
-  "requirements": []
+  "requirements": [],
+  "ssdp": [],
+  "zeroconf": [],
+  "homekit": {},
+  "dependencies": {},
+  "after_dependencies": ["input_boolean", "input_datetime", "input_number", "input_select", "ozw", "zwave"],
+  "codeowners": ["@FutureTense", "@firstof9", "@ccsliinc"]
 }
